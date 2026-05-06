@@ -32,7 +32,7 @@ def download_ffhq(
     output_path.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading FFHQ thumbnails dataset from HuggingFace...")
-    ds = load_dataset("nhnn/ffhq-thumbnails-128x128", split="train")
+    ds = load_dataset("nuwandaa/ffhq128", split="train")
 
     num_images = min(num_images, len(ds))
     print(f"Saving {num_images} images to {output_path}...")
