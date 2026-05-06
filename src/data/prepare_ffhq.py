@@ -34,7 +34,7 @@ def download_ffhq(
         return len(existing)
 
     print("Loading FFHQ thumbnails dataset from HuggingFace...")
-    ds = load_dataset("nuwandaa/ffhq128", split="train")
+    ds = load_dataset("nuwandaa/ffhq128", split="train", keep_in_memory=True)
 
     num_images = min(num_images, len(ds))
     subset = ds.select(range(num_images))
