@@ -5,22 +5,9 @@ Downloads a subset of the FFHQ dataset to serve as real face images
 for the deepfake detection pipeline.
 """
 
-import io
-import os
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from PIL import Image
 from tqdm import tqdm
-
-
-def _save_image(args):
-    """Load image from raw bytes and save as PNG."""
-    raw_bytes, filepath, resolution = args
-    img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-    if img.size != (resolution, resolution):
-        img = img.resize((resolution, resolution), Image.LANCZOS)
-    img.save(filepath, compress_level=1)
 
 
 def download_ffhq(
@@ -36,7 +23,6 @@ def download_ffhq(
         num_images: Number of images to download.
         resolution: Target resolution (images are already 128x128 from this dataset).
     """
-    import datasets
     from datasets import load_dataset
 
     output_path = Path(output_dir)
@@ -51,31 +37,27 @@ def download_ffhq(
     ds = load_dataset("nuwandaa/ffhq128", split="train")
 
     num_images = min(num_images, len(ds))
-
-    # Disable image decoding — gives us raw bytes instead of PIL objects
-    ds = ds.cast_column("image", datasets.Image(decode=False))
     subset = ds.select(range(num_images))
 
     print(f"Saving {num_images} images to {output_path}...")
 
-    batch_size = 256
-    num_workers = min(8, os.cpu_count() or 4)
-    saved = 0
+    out_dir_str = str(output_path)
+    res = resolution
 
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        for batch_start in tqdm(range(0, num_images, batch_size), desc="Saving FFHQ images"):
-            batch_end = min(batch_start + batch_size, num_images)
-            batch = subset[batch_start:batch_end]
+    def save_example(example, idx):
+        from PIL import Image as PILImage
 
-            tasks = []
-            for j, img_dict in enumerate(batch["image"]):
-                raw_bytes = img_dict["bytes"]
-                filepath = output_path / f"{batch_start + j:05d}.png"
-                tasks.append((raw_bytes, filepath, resolution))
+        img = example["image"]
+        if not isinstance(img, PILImage.Image):
+            img = PILImage.fromarray(img)
+        if img.size != (res, res):
+            img = img.resize((res, res), PILImage.LANCZOS)
+        img.convert("RGB").save(f"{out_dir_str}/{idx:05d}.png", compress_level=1)
+        return example
 
-            list(executor.map(_save_image, tasks))
-            saved += len(tasks)
+    subset.map(save_example, with_indices=True, num_proc=4, desc="Saving FFHQ images")
 
+    saved = len(list(output_path.glob("*.png")))
     print(f"Done. Saved {saved} images to {output_path}")
     return saved
 
