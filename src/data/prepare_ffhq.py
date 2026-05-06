@@ -33,33 +33,42 @@ def download_ffhq(
         print(f"Already have {len(existing)} images in {output_path}, skipping download.")
         return len(existing)
 
-    print("Loading FFHQ thumbnails dataset from HuggingFace...")
-    ds = load_dataset("nuwandaa/ffhq128", split="train", keep_in_memory=True)
-
-    num_images = min(num_images, len(ds))
-    subset = ds.select(range(num_images))
+    print("Streaming FFHQ thumbnails dataset from HuggingFace...")
+    ds = load_dataset("nuwandaa/ffhq128", split="train", streaming=True)
 
     print(f"Saving {num_images} images to {output_path}...")
 
-    out_dir_str = str(output_path)
-    res = resolution
+    saved = 0
+    with tqdm(total=num_images, desc="Saving FFHQ images") as progress:
+        for idx, example in enumerate(ds):
+            if idx >= num_images:
+                break
 
-    def save_example(example, idx):
-        from PIL import Image as PILImage
+            img_path = output_path / f"{idx:05d}.png"
+            if img_path.exists():
+                saved += 1
+                progress.update(1)
+                continue
 
-        img = example["image"]
-        if not isinstance(img, PILImage.Image):
-            img = PILImage.fromarray(img)
-        if img.size != (res, res):
-            img = img.resize((res, res), PILImage.LANCZOS)
-        img.convert("RGB").save(f"{out_dir_str}/{idx:05d}.png", compress_level=1)
-        return example
+            img = _prepare_image(example, resolution)
+            img.save(img_path, compress_level=1)
+            saved += 1
+            progress.update(1)
 
-    subset.map(save_example, with_indices=True, num_proc=4, desc="Saving FFHQ images")
-
-    saved = len(list(output_path.glob("*.png")))
     print(f"Done. Saved {saved} images to {output_path}")
     return saved
+
+
+def _prepare_image(example, resolution: int):
+    """Convert a HuggingFace image example to the requested RGB resolution."""
+    from PIL import Image as PILImage
+
+    img = example["image"]
+    if not isinstance(img, PILImage.Image):
+        img = PILImage.fromarray(img)
+    if img.size != (resolution, resolution):
+        img = img.resize((resolution, resolution), PILImage.LANCZOS)
+    return img.convert("RGB")
 
 
 if __name__ == "__main__":

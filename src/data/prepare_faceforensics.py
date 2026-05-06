@@ -8,10 +8,12 @@ the FaceSwap manipulation subset, and resizes to 128x128.
 import os
 import random
 from pathlib import Path
-from typing import Optional, List
 
 import cv2
 from tqdm import tqdm
+
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
+VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv"}
 
 
 def download_faceforensics_kaggle() -> str:
@@ -29,37 +31,114 @@ def download_faceforensics_kaggle() -> str:
     return path
 
 
+def _list_image_frames(path: Path):
+    return sorted([f for f in path.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_SUFFIXES])
+
+
+def _list_video_files(path: Path):
+    return sorted([f for f in path.iterdir() if f.is_file() and f.suffix.lower() in VIDEO_SUFFIXES])
+
+
+def _has_extractable_media(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    if _list_image_frames(path) or _list_video_files(path):
+        return True
+    return any(child.is_dir() and _list_image_frames(child) for child in path.iterdir())
+
+
 def find_faceswap_dir(kaggle_root: str) -> Path:
     """
-    Locate the FaceSwap images directory within the Kaggle download.
+    Locate the FaceSwap media directory within the Kaggle download.
     The structure varies, so we search for it.
     """
     kaggle_path = Path(kaggle_root)
 
     candidates = [
         kaggle_path / "manipulated_sequences" / "FaceSwap" / "c23" / "images",
+        kaggle_path / "manipulated_sequences" / "FaceSwap" / "c23" / "videos",
+        kaggle_path / "manipulated_sequences" / "FaceSwap" / "images",
+        kaggle_path / "manipulated_sequences" / "FaceSwap" / "videos",
         kaggle_path / "FaceSwap" / "c23" / "images",
+        kaggle_path / "FaceSwap" / "c23" / "videos",
         kaggle_path / "c23" / "FaceSwap" / "images",
+        kaggle_path / "c23" / "FaceSwap" / "videos",
         kaggle_path / "FaceSwap" / "images",
+        kaggle_path / "FaceSwap" / "videos",
     ]
 
     for candidate in candidates:
-        if candidate.exists():
+        if _has_extractable_media(candidate):
             return candidate
 
-    # Fallback: search recursively for a directory named "FaceSwap"
-    for root, dirs, _ in os.walk(str(kaggle_path)):
-        if "FaceSwap" in dirs:
-            potential = Path(root) / "FaceSwap"
-            # Look for images subdirectory
-            for sub in potential.rglob("images"):
-                if sub.is_dir() and any(sub.iterdir()):
-                    return sub
+    # Fallback: search case-insensitively under any FaceSwap folder.
+    faceswap_roots = [
+        path for path in kaggle_path.rglob("*")
+        if path.is_dir() and path.name.lower() == "faceswap"
+    ]
+    for faceswap_root in faceswap_roots:
+        if _has_extractable_media(faceswap_root):
+            return faceswap_root
+
+        for sub in faceswap_root.rglob("*"):
+            if sub.is_dir() and _has_extractable_media(sub):
+                return sub
+
+    available = sorted(str(path.relative_to(kaggle_path)) for path in faceswap_roots[:10])
+    hint = f" FaceSwap-like directories found: {available}." if available else ""
 
     raise FileNotFoundError(
-        f"Could not find FaceSwap images directory in {kaggle_root}. "
-        f"Please check the dataset structure."
+        f"Could not find FaceSwap images or videos in {kaggle_root}."
+        f"{hint} Please inspect the dataset structure with: "
+        f"!find {kaggle_root} -maxdepth 4 -type d | head -50"
     )
+
+
+def _evenly_spaced_indices(total_frames: int, frames_per_video: int):
+    if total_frames <= 0:
+        return []
+    if frames_per_video <= 1 or total_frames == 1:
+        return [0]
+    if total_frames >= frames_per_video:
+        return [
+            int(i * (total_frames - 1) / (frames_per_video - 1))
+            for i in range(frames_per_video)
+        ]
+    return list(range(total_frames))
+
+
+def _write_resized_frame(img, output_path: Path, frame_count: int, resolution: int) -> int:
+    if img is None:
+        return frame_count
+
+    img = cv2.resize(img, (resolution, resolution), interpolation=cv2.INTER_AREA)
+    output_file = output_path / f"{frame_count:05d}.png"
+    cv2.imwrite(str(output_file), img)
+    return frame_count + 1
+
+
+def _extract_from_image_dir(video_dir: Path, output_path: Path, frame_count: int, frames_per_video: int, resolution: int) -> int:
+    frames = _list_image_frames(video_dir)
+
+    for idx in _evenly_spaced_indices(len(frames), frames_per_video):
+        img = cv2.imread(str(frames[idx]))
+        frame_count = _write_resized_frame(img, output_path, frame_count, resolution)
+
+    return frame_count
+
+
+def _extract_from_video_file(video_file: Path, output_path: Path, frame_count: int, frames_per_video: int, resolution: int) -> int:
+    cap = cv2.VideoCapture(str(video_file))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    for idx in _evenly_spaced_indices(total_frames, frames_per_video):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        if ok:
+            frame_count = _write_resized_frame(frame, output_path, frame_count, resolution)
+
+    cap.release()
+    return frame_count
 
 
 def extract_frames(
@@ -71,12 +150,12 @@ def extract_frames(
     seed: int = 42,
 ):
     """
-    Extract evenly-spaced frames from FaceSwap video directories.
+    Extract evenly-spaced frames from FaceSwap image directories or video files.
 
     Args:
-        faceswap_dir: Path to FaceSwap images directory (contains subdirs per video).
+        faceswap_dir: Path to FaceSwap media directory.
         output_dir: Directory to save extracted frames.
-        num_videos: Number of video subdirectories to sample from.
+        num_videos: Number of video sources to sample from.
         frames_per_video: Number of frames to extract per video.
         resolution: Target resolution for output images.
         seed: Random seed for video selection.
@@ -85,42 +164,44 @@ def extract_frames(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    video_dirs = sorted([d for d in faceswap_path.iterdir() if d.is_dir()])
-    print(f"Found {len(video_dirs)} video directories")
+    image_dirs = sorted([
+        d for d in faceswap_path.iterdir()
+        if d.is_dir() and _list_image_frames(d)
+    ])
+    direct_images = _list_image_frames(faceswap_path)
+    video_files = _list_video_files(faceswap_path)
+
+    if image_dirs:
+        sources = image_dirs
+        source_type = "image directories"
+    elif video_files:
+        sources = video_files
+        source_type = "video files"
+    elif direct_images:
+        sources = [faceswap_path]
+        source_type = "flat image directory"
+    else:
+        raise FileNotFoundError(f"No image frames or videos found in {faceswap_path}")
+
+    print(f"Found {len(sources)} FaceSwap {source_type}")
 
     random.seed(seed)
-    if len(video_dirs) > num_videos:
-        video_dirs = random.sample(video_dirs, num_videos)
+    if len(sources) > num_videos:
+        sources = random.sample(sources, num_videos)
     else:
-        num_videos = len(video_dirs)
+        num_videos = len(sources)
         print(f"Only {num_videos} videos available, using all of them")
 
     frame_count = 0
-    for video_dir in tqdm(video_dirs, desc="Extracting frames"):
-        frames = sorted([
-            f for f in video_dir.iterdir()
-            if f.suffix.lower() in {".png", ".jpg", ".jpeg"}
-        ])
-
-        if len(frames) == 0:
-            continue
-
-        # Select evenly-spaced frames
-        if len(frames) >= frames_per_video:
-            indices = [int(i * (len(frames) - 1) / (frames_per_video - 1))
-                       for i in range(frames_per_video)]
+    for source in tqdm(sources, desc="Extracting frames"):
+        if source.is_file():
+            frame_count = _extract_from_video_file(
+                source, output_path, frame_count, frames_per_video, resolution
+            )
         else:
-            indices = list(range(len(frames)))
-
-        for idx in indices:
-            img = cv2.imread(str(frames[idx]))
-            if img is None:
-                continue
-
-            img = cv2.resize(img, (resolution, resolution), interpolation=cv2.INTER_AREA)
-            output_file = output_path / f"{frame_count:05d}.png"
-            cv2.imwrite(str(output_file), img)
-            frame_count += 1
+            frame_count = _extract_from_image_dir(
+                source, output_path, frame_count, frames_per_video, resolution
+            )
 
     print(f"Done. Extracted {frame_count} frames to {output_path}")
     return frame_count
