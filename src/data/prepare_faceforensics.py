@@ -214,6 +214,15 @@ def prepare_faceforensics(
     resolution: int = 128,
 ):
     """Full pipeline: download from Kaggle and extract frames."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    expected_frames = num_videos * frames_per_video
+    existing = list(output_path.glob("*.png"))
+    if len(existing) >= expected_frames:
+        print(f"Already have {len(existing)} FaceSwap frames in {output_path}, skipping download and extraction.")
+        return len(existing)
+
     kaggle_root = download_faceforensics_kaggle()
     faceswap_dir = find_faceswap_dir(kaggle_root)
     print(f"Found FaceSwap directory: {faceswap_dir}")
