@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data (large files, download at runtime)
+data/real/
+data/faceswap/
+data/diffusion_sd15/
+!data/splits/.gitkeep
+
+# Model checkpoints
+results/checkpoints/
+*.pth
+*.pt
+
+# Results (regenerated from notebooks)
+results/figures/*.png
+results/metrics/*.csv
+
+# TensorBoard
+results/tensorboard/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Kaggle credentials
+kaggle.json
