@@ -6,11 +6,22 @@ for the deepfake detection pipeline.
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional
 
 from PIL import Image
 from tqdm import tqdm
+
+
+def _save_image(args):
+    """Save a single image to disk (used by thread pool)."""
+    img, filepath, resolution = args
+    if not isinstance(img, Image.Image):
+        img = Image.fromarray(img)
+    if img.size != (resolution, resolution):
+        img = img.resize((resolution, resolution), Image.LANCZOS)
+    img = img.convert("RGB")
+    img.save(filepath, compress_level=1)
 
 
 def download_ffhq(
@@ -31,26 +42,38 @@ def download_ffhq(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading FFHQ thumbnails dataset from HuggingFace...")
-    ds = load_dataset("nuwandaa/ffhq128", split="train")
+    existing = set(output_path.glob("*.png"))
+    if len(existing) >= num_images:
+        print(f"Already have {len(existing)} images in {output_path}, skipping download.")
+        return len(existing)
+
+    print("Loading FFHQ thumbnails dataset from HuggingFace...")
+    ds = load_dataset("nuwandaa/ffhq128", split="train", streaming=False)
 
     num_images = min(num_images, len(ds))
+    subset = ds.select(range(num_images))
+
     print(f"Saving {num_images} images to {output_path}...")
 
-    for i in tqdm(range(num_images), desc="Saving FFHQ images"):
-        img = ds[i]["image"]
+    batch_size = 64
+    num_workers = min(8, os.cpu_count() or 4)
+    saved = 0
 
-        if not isinstance(img, Image.Image):
-            img = Image.fromarray(img)
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        for batch_start in tqdm(range(0, num_images, batch_size), desc="Saving FFHQ images"):
+            batch_end = min(batch_start + batch_size, num_images)
+            batch = subset[batch_start:batch_end]
+            images = batch["image"]
 
-        if img.size != (resolution, resolution):
-            img = img.resize((resolution, resolution), Image.LANCZOS)
+            tasks = [
+                (img, output_path / f"{batch_start + j:05d}.png", resolution)
+                for j, img in enumerate(images)
+            ]
+            list(executor.map(_save_image, tasks))
+            saved += len(tasks)
 
-        img = img.convert("RGB")
-        img.save(output_path / f"{i:05d}.png")
-
-    print(f"Done. Saved {num_images} images to {output_path}")
-    return num_images
+    print(f"Done. Saved {saved} images to {output_path}")
+    return saved
 
 
 if __name__ == "__main__":
