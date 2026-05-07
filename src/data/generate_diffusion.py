@@ -61,10 +61,27 @@ def generate_diffusion_faces(
         num_inference_steps: Number of denoising steps.
         guidance_scale: Classifier-free guidance scale.
     """
-    from diffusers import StableDiffusionPipeline
-
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+
+    existing = sorted(output_path.glob("*.png"))
+    if len(existing) >= num_images:
+        print(
+            f"Already have {len(existing)} diffusion images in {output_path}, "
+            f"skipping generation."
+        )
+        return len(existing)
+    if existing:
+        # Partial state from an interrupted run. Restarting from index 0 keeps
+        # the generator/seed contract intact, so the final 1000 images match
+        # what a clean run would produce. Existing files at indices 0..N-1
+        # are simply overwritten as we re-generate them.
+        print(
+            f"Found {len(existing)} partial diffusion images in {output_path}; "
+            f"regenerating all {num_images} from scratch to preserve determinism."
+        )
+
+    from diffusers import StableDiffusionPipeline
 
     print(f"Loading Stable Diffusion pipeline: {model_id}")
     pipe = StableDiffusionPipeline.from_pretrained(
