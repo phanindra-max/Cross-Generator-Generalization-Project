@@ -5,6 +5,7 @@ Downloads the FF++ c23 dataset via kagglehub, extracts frames from
 the FaceSwap manipulation subset, and resizes to 128x128.
 """
 
+import multiprocessing as mp
 import os
 import random
 from pathlib import Path
@@ -55,6 +56,8 @@ def find_faceswap_dir(kaggle_root: str) -> Path:
     kaggle_path = Path(kaggle_root)
 
     candidates = [
+        # Actual layout for xdxd003/ff-c23 — try this first to skip rglob.
+        kaggle_path / "FaceForensics++_C23" / "FaceSwap",
         kaggle_path / "manipulated_sequences" / "FaceSwap" / "c23" / "images",
         kaggle_path / "manipulated_sequences" / "FaceSwap" / "c23" / "videos",
         kaggle_path / "manipulated_sequences" / "FaceSwap" / "images",
@@ -107,38 +110,48 @@ def _evenly_spaced_indices(total_frames: int, frames_per_video: int):
     return list(range(total_frames))
 
 
-def _write_resized_frame(img, output_path: Path, frame_count: int, resolution: int) -> int:
+def _write_resized(img, output_file: Path, resolution: int) -> bool:
     if img is None:
-        return frame_count
-
+        return False
     img = cv2.resize(img, (resolution, resolution), interpolation=cv2.INTER_AREA)
-    output_file = output_path / f"{frame_count:05d}.png"
     cv2.imwrite(str(output_file), img)
-    return frame_count + 1
+    return True
 
 
-def _extract_from_image_dir(video_dir: Path, output_path: Path, frame_count: int, frames_per_video: int, resolution: int) -> int:
-    frames = _list_image_frames(video_dir)
+def _extract_one_source(args):
+    """
+    Worker for multiprocessing.Pool. Extract frames from a single source
+    (video file or image directory) and write them with deterministic,
+    per-source filenames so workers don't collide.
 
-    for idx in _evenly_spaced_indices(len(frames), frames_per_video):
-        img = cv2.imread(str(frames[idx]))
-        frame_count = _write_resized_frame(img, output_path, frame_count, resolution)
+    Returns the number of frames written.
+    """
+    src_idx, source_str, output_dir_str, frames_per_video, resolution = args
+    source = Path(source_str)
+    output_path = Path(output_dir_str)
 
-    return frame_count
+    written = 0
+    if source.is_file() and source.suffix.lower() in VIDEO_SUFFIXES:
+        cap = cv2.VideoCapture(str(source))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        for frame_idx, idx in enumerate(_evenly_spaced_indices(total, frames_per_video)):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            out_file = output_path / f"{src_idx:05d}_{frame_idx:02d}.png"
+            if _write_resized(frame, out_file, resolution):
+                written += 1
+        cap.release()
+    elif source.is_dir():
+        frames = _list_image_frames(source)
+        for frame_idx, idx in enumerate(_evenly_spaced_indices(len(frames), frames_per_video)):
+            img = cv2.imread(str(frames[idx]))
+            out_file = output_path / f"{src_idx:05d}_{frame_idx:02d}.png"
+            if _write_resized(img, out_file, resolution):
+                written += 1
 
-
-def _extract_from_video_file(video_file: Path, output_path: Path, frame_count: int, frames_per_video: int, resolution: int) -> int:
-    cap = cv2.VideoCapture(str(video_file))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    for idx in _evenly_spaced_indices(total_frames, frames_per_video):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, frame = cap.read()
-        if ok:
-            frame_count = _write_resized_frame(frame, output_path, frame_count, resolution)
-
-    cap.release()
-    return frame_count
+    return written
 
 
 def extract_frames(
@@ -148,9 +161,11 @@ def extract_frames(
     frames_per_video: int = 4,
     resolution: int = 128,
     seed: int = 42,
+    num_workers: int = None,
 ):
     """
-    Extract evenly-spaced frames from FaceSwap image directories or video files.
+    Extract evenly-spaced frames from FaceSwap image directories or video files,
+    in parallel via a process pool.
 
     Args:
         faceswap_dir: Path to FaceSwap media directory.
@@ -159,6 +174,7 @@ def extract_frames(
         frames_per_video: Number of frames to extract per video.
         resolution: Target resolution for output images.
         seed: Random seed for video selection.
+        num_workers: Number of parallel worker processes. Defaults to cpu_count - 1.
     """
     faceswap_path = Path(faceswap_dir)
     output_path = Path(output_dir)
@@ -192,19 +208,27 @@ def extract_frames(
         num_videos = len(sources)
         print(f"Only {num_videos} videos available, using all of them")
 
-    frame_count = 0
-    for source in tqdm(sources, desc="Extracting frames"):
-        if source.is_file():
-            frame_count = _extract_from_video_file(
-                source, output_path, frame_count, frames_per_video, resolution
-            )
-        else:
-            frame_count = _extract_from_image_dir(
-                source, output_path, frame_count, frames_per_video, resolution
-            )
+    if num_workers is None:
+        num_workers = max(1, (os.cpu_count() or 4) - 1)
 
-    print(f"Done. Extracted {frame_count} frames to {output_path}")
-    return frame_count
+    args_list = [
+        (src_idx, str(source), str(output_path), frames_per_video, resolution)
+        for src_idx, source in enumerate(sources)
+    ]
+
+    print(f"Extracting frames with {num_workers} parallel workers...")
+
+    total_written = 0
+    with mp.Pool(processes=num_workers) as pool:
+        for written in tqdm(
+            pool.imap_unordered(_extract_one_source, args_list),
+            total=len(args_list),
+            desc="Extracting frames",
+        ):
+            total_written += written
+
+    print(f"Done. Extracted {total_written} frames to {output_path}")
+    return total_written
 
 
 def prepare_faceforensics(
@@ -212,6 +236,7 @@ def prepare_faceforensics(
     num_videos: int = 500,
     frames_per_video: int = 4,
     resolution: int = 128,
+    num_workers: int = None,
 ):
     """Full pipeline: download from Kaggle and extract frames."""
     output_path = Path(output_dir)
@@ -233,6 +258,7 @@ def prepare_faceforensics(
         num_videos=num_videos,
         frames_per_video=frames_per_video,
         resolution=resolution,
+        num_workers=num_workers,
     )
     return num_extracted
 
@@ -245,6 +271,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-videos", type=int, default=500)
     parser.add_argument("--frames-per-video", type=int, default=4)
     parser.add_argument("--resolution", type=int, default=128)
+    parser.add_argument("--num-workers", type=int, default=None)
     args = parser.parse_args()
 
     prepare_faceforensics(
@@ -252,4 +279,5 @@ if __name__ == "__main__":
         num_videos=args.num_videos,
         frames_per_video=args.frames_per_video,
         resolution=args.resolution,
+        num_workers=args.num_workers,
     )

@@ -5,6 +5,8 @@ Downloads a subset of the FFHQ dataset to serve as real face images
 for the deepfake detection pipeline.
 """
 
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from tqdm import tqdm
@@ -14,14 +16,20 @@ def download_ffhq(
     output_dir: str,
     num_images: int = 2000,
     resolution: int = 128,
+    max_workers: int = 8,
 ):
     """
     Download FFHQ thumbnails from HuggingFace and save as PNGs.
+
+    Uses non-streaming load with a row slice so the underlying parquet
+    shards download in parallel via huggingface_hub. PNG encode + write
+    are dispatched to a thread pool.
 
     Args:
         output_dir: Directory to save the images.
         num_images: Number of images to download.
         resolution: Target resolution (images are already 128x128 from this dataset).
+        max_workers: Number of threads for parallel image saves.
     """
     from datasets import load_dataset
 
@@ -33,27 +41,34 @@ def download_ffhq(
         print(f"Already have {len(existing)} images in {output_path}, skipping download.")
         return len(existing)
 
-    print("Streaming FFHQ thumbnails dataset from HuggingFace...")
-    ds = load_dataset("nuwandaa/ffhq128", split="train", streaming=True)
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    print(
+        f"Downloading FFHQ thumbnails (first {num_images}) from HuggingFace "
+        f"(auth={'yes' if token else 'no'})..."
+    )
 
-    print(f"Saving {num_images} images to {output_path}...")
+    ds = load_dataset(
+        "nuwandaa/ffhq128",
+        split=f"train[:{num_images}]",
+        token=token,
+    )
+
+    print(f"Saving {num_images} images to {output_path} ({max_workers} workers)...")
+
+    def _save_one(idx: int) -> int:
+        img_path = output_path / f"{idx:05d}.png"
+        if img_path.exists():
+            return idx
+        img = _prepare_image(ds[idx], resolution)
+        img.save(img_path, compress_level=1)
+        return idx
 
     saved = 0
-    with tqdm(total=num_images, desc="Saving FFHQ images") as progress:
-        for idx, example in enumerate(ds):
-            if idx >= num_images:
-                break
-
-            img_path = output_path / f"{idx:05d}.png"
-            if img_path.exists():
-                saved += 1
-                progress.update(1)
-                continue
-
-            img = _prepare_image(example, resolution)
-            img.save(img_path, compress_level=1)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_save_one, i) for i in range(num_images)]
+        for fut in tqdm(as_completed(futures), total=num_images, desc="Saving FFHQ images"):
+            fut.result()
             saved += 1
-            progress.update(1)
 
     print(f"Done. Saved {saved} images to {output_path}")
     return saved
