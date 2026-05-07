@@ -7,6 +7,13 @@ Implements the constrained convolutional layer from:
 
 The key idea: the first convolutional layer is constrained so its filters
 sum to zero (suppressing image content and emphasizing residual noise patterns).
+
+Deviations from Bayar 2018 (documented for the writeup, not correctness bugs):
+  - Bayar uses grayscale input with 3 filters; this implementation uses RGB
+    input with 5 filters per output channel. Treat as "Bayar-style" rather
+    than a literal reproduction.
+  - Bayar's reference implementation uses padding=0 on the constrained layer.
+    This implementation uses same-padding for downstream shape convenience.
 """
 
 import torch
@@ -16,9 +23,18 @@ import torch.nn.functional as F
 
 class ConstrainedConvLayer(nn.Module):
     """
-    Constrained convolutional layer where filter weights are normalized so that
-    the center weight is -1 and all other weights sum to 1. This forces the
-    layer to act as a high-pass / prediction-error filter.
+    Constrained convolutional layer (Bayar Algorithm 1).
+
+    The parameter `self.weight` is constrained so that, for every (out_ch, in_ch)
+    filter slice:
+        w[c, c]                = -1
+        sum(w[h, w] for (h,w) != (c,c)) = +1
+    Equivalent to a high-pass / prediction-error filter (filter sums to zero).
+
+    Constraint is enforced by HARD projection (`project()`), not by a
+    differentiable normalization in forward. The training loop must call
+    `project()` after every `optimizer.step()` so the parameter itself stays
+    on the constraint manifold between updates. This matches Bayar's Algorithm 1.
     """
 
     def __init__(self, in_channels: int = 3, out_channels: int = 5, kernel_size: int = 5):
@@ -28,35 +44,33 @@ class ConstrainedConvLayer(nn.Module):
         self.kernel_size = kernel_size
 
         self.weight = nn.Parameter(
-            torch.randn(out_channels, in_channels, kernel_size, kernel_size)
+            torch.empty(out_channels, in_channels, kernel_size, kernel_size)
         )
         nn.init.xavier_normal_(self.weight)
+        self.project()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        constrained_weights = self._apply_constraint()
-        return F.conv2d(x, constrained_weights, padding=self.kernel_size // 2)
+        return F.conv2d(x, self.weight, padding=self.kernel_size // 2)
 
-    def _apply_constraint(self) -> torch.Tensor:
+    @torch.no_grad()
+    def project(self) -> None:
         """
-        Apply the Bayar constraint: center pixel weight = -1,
-        remaining weights normalized to sum to 1 per filter per input channel.
+        Hard-project `self.weight` onto the Bayar constraint manifold.
+        Call once at init and after every optimizer.step().
         """
-        weights = self.weight.clone()
-        center = self.kernel_size // 2
+        c = self.kernel_size // 2
+        w = self.weight.data
+        w[:, :, c, c] = 0.0
 
-        # Zero out center, normalize the rest to sum to 1, then set center to -1
-        with torch.no_grad():
-            weights[:, :, center, center] = 0
+        # Sum is over off-center positions only (center is now zero).
+        denom = w.sum(dim=(2, 3), keepdim=True)
+        # Guard against degenerate filters whose off-center sum is ~0.
+        # Falling back to 1 leaves them un-rescaled this step; the next
+        # gradient + projection iterates them out of the degenerate region.
+        safe = torch.where(denom.abs() < 1e-8, torch.ones_like(denom), denom)
+        w.div_(safe)
 
-        # Normalize non-center weights to sum to 1
-        weight_sum = weights.sum(dim=(2, 3), keepdim=True)
-        weight_sum[weight_sum == 0] = 1.0
-        weights = weights / weight_sum
-
-        # Set center to -1
-        weights[:, :, center, center] = -1.0
-
-        return weights
+        w[:, :, c, c] = -1.0
 
 
 class ConstrainedCNN(nn.Module):
@@ -122,6 +136,10 @@ class ConstrainedCNN(nn.Module):
         x = self.features(x)
         x = self.classifier(x)
         return x
+
+    def project_constraints(self) -> None:
+        """Re-project the constrained front end. Call after optimizer.step()."""
+        self.constrained_conv.project()
 
     def get_residual(self, x: torch.Tensor) -> torch.Tensor:
         """Extract the constrained-conv residual for visualization."""

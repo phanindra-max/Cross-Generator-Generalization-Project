@@ -68,6 +68,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
+        if hasattr(model, "project_constraints"):
+            model.project_constraints()
 
         total_loss += loss.item() * images.size(0)
         _, predicted = outputs.max(1)
